@@ -1,0 +1,35 @@
+version: '3'
+
+vars:
+  LOCAL_BIN: './bin'
+  GOLANGCI_VERSION: latest
+
+tasks:
+  info:
+    cmds:
+      - task --list
+    silent: true
+
+  install-golangci-lint:
+    desc: Install golangci-lint into ./bin
+    status:
+      - test -x {{.LOCAL_BIN}}/golangci-lint
+    cmds:
+      - GOBIN="$(pwd)/bin" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_VERSION}}
+
+  lint:
+    desc: Run linters
+    deps: [install-golangci-lint]
+    cmds:
+      - '{{.LOCAL_BIN}}/golangci-lint{{exeExt}} run ./...'
+
+  lint-fix:
+    desc: Run linters with autofix
+    deps: [install-golangci-lint]
+    cmds:
+      - '{{.LOCAL_BIN}}/golangci-lint{{exeExt}} run ./... --fix'
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test ./... -v -cover

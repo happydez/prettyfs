@@ -1,0 +1,67 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - revive
+    - gosec
+    - bodyclose
+    - errorlint
+    - nilerr
+    - contextcheck
+    - noctx
+    - misspell
+    - unconvert
+    - wastedassign
+
+  settings:
+    govet:
+      enable:
+        - shadow
+    gosec:
+      excludes:
+        - G204
+        - G304
+        - G401
+        - G404
+        - G501
+    goconst:
+      min-len: 5
+      min-occurrences: 3
+    errcheck:
+      check-type-assertions: true
+      exclude-functions:
+        - (*os.File).Close
+        - (io.Closer).Close
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+
+  exclusions:
+    paths:
+      - bin
+      - vendor
+      - tmp
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+
+formatters:
+  enable:
+    - goimports
+    - gofmt
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

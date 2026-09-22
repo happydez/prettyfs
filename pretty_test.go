@@ -379,6 +379,36 @@ func TestRateLimit(t *testing.T) {
 	}
 }
 
+func TestDownloadRequestRateLimit(t *testing.T) {
+	h := FileServer(testFS(), WithDownloadRequestRateLimit(2, time.Minute))
+
+	for i := 0; i < 5; i++ {
+		if c := do(h, "GET", "/").Code; c != 200 {
+			t.Fatalf("listing limited by download limiter: %d", c)
+		}
+	}
+
+	if c := do(h, "GET", "/hello.txt").Code; c != 200 {
+		t.Fatalf("first download: %d", c)
+	}
+	if c := do(h, "GET", "/hello.txt").Code; c != 200 {
+		t.Fatalf("second download: %d", c)
+	}
+	if c := do(h, "GET", "/hello.txt").Code; c != 429 {
+		t.Fatalf("third download of the same file: %d, want 429", c)
+	}
+
+	h = FileServer(testFS(), WithDownloadRequestRateLimit(2, time.Minute))
+	for i := 0; i < 5; i++ {
+		if c := do(h, "GET", "/hello.txt", "Range", "bytes=0-1").Code; c != http.StatusPartialContent {
+			t.Fatalf("range chunk %d: %d, want 206", i, c)
+		}
+	}
+	if c := do(h, "GET", "/docs/readme.md").Code; c != 200 {
+		t.Fatalf("second file after ranges: %d", c)
+	}
+}
+
 func TestGlobalRateLimit(t *testing.T) {
 	h := FileServer(testFS(), WithGlobalRateLimit(2, time.Minute), WithRateLimit(100, time.Minute))
 	if doFrom(h, "10.0.0.1", "/") != 200 || doFrom(h, "10.0.0.2", "/") != 200 {

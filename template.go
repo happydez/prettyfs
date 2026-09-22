@@ -66,6 +66,7 @@ var listTmpl = template.Must(template.New("list").Funcs(funcs).Parse(`<!DOCTYPE 
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{.Path}} - {{.Title}}</title>
+{{if .Favicon}}<link rel="icon" href="{{.Favicon}}">{{end}}
 <style>` + baseCSS + `
 header{padding-bottom:22px}
 .title{margin:0 0 14px;font-size:13px;color:var(--muted);letter-spacing:.01em}
@@ -133,7 +134,7 @@ header{padding-bottom:22px}
   <div class="row{{if .IsDir}} dir{{end}}">
     <div class="name">{{icon .Kind}}<a href="{{.Href}}" title="{{.Name}}">{{.Name}}{{if .IsDir}}/{{end}}</a>{{if .Ext}}<span class="ext">{{.Ext}}</span>{{end}}</div>
     <div class="date" title="{{.ModTime.Format "2006-01-02 15:04:05 MST"}}">{{.ModTime.Format "2006-01-02 15:04"}}</div>
-    <div class="size">{{if .IsDir}}·{{else}}{{bytes .Size}}{{end}}</div>
+    <div class="size">{{if .IsDir}}—{{else}}{{bytes .Size}}{{end}}</div>
     {{if or (not .IsDir) $.Zip}}<a class="dl" href="{{.DownloadHref}}" title="Download{{if .IsDir}} as .zip{{end}}" aria-label="Download {{.Name}}">{{icon "download"}}</a>{{else}}<div></div>{{end}}
   </div>
   {{end}}
@@ -155,7 +156,8 @@ var errorTmpl = template.Must(template.New("error").Parse(`<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{.Code}} {{.Status}} · {{.Title}}</title>
+<title>{{.Code}} {{.Status}} - {{.Title}}</title>
+{{if .Favicon}}<link rel="icon" href="{{.Favicon}}">{{end}}
 <style>` + baseCSS + `
 .box{max-width:560px;padding-top:10vh}
 .code{margin:0;font:500 clamp(72px,14vw,128px)/.9 var(--mono);letter-spacing:-.06em;color:var(--ink)}

@@ -8,6 +8,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"html/template"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -27,13 +28,21 @@ import (
 )
 
 // pageCSP is set on listings and error pages.
-const pageCSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+const pageCSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+
+const defaultFavicon = "data:image/svg+xml," +
+	"%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E" +
+	"%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%230b0b0b'/%3E" +
+	"%3Ctext%20x='32'%20y='45'%20text-anchor='middle'%20fill='%23ffffff'" +
+	"%20font-family='Helvetica,Arial,sans-serif'%20font-size='34'%20font-weight='700'%3E" +
+	"fs%3C/text%3E%3C/svg%3E"
 
 // Option configures FileServer.
 type Option func(*config)
 
 type config struct {
 	title          string
+	favicon        string
 	privateMarker  string
 	showHidden     bool
 	serveIndex     bool
@@ -55,6 +64,14 @@ type config struct {
 func WithTitle(title string) Option {
 	return func(c *config) {
 		c.title = title
+	}
+}
+
+// WithFavicon sets the listing favicon: a URL or a data: URI.
+// An empty value removes the link.
+func WithFavicon(v string) Option {
+	return func(c *config) {
+		c.favicon = v
 	}
 }
 
@@ -215,6 +232,7 @@ func FileServer(fsys fs.FS, opts ...Option) http.Handler {
 
 	cfg := config{
 		title:         "Files",
+		favicon:       defaultFavicon,
 		privateMarker: ".private",
 		serveIndex:    true,
 		sandbox:       true,
@@ -680,6 +698,7 @@ func (h *prettyFileHandler) serveDir(w http.ResponseWriter, r *http.Request, f f
 
 	data := listing{
 		Title:     h.cfg.title,
+		Favicon:   template.URL(h.cfg.favicon), //nolint:gosec // G203: favicon comes from server config, not user input
 		Path:      name,
 		Crumbs:    crumbs(name),
 		HasParent: name != "/",
@@ -758,6 +777,7 @@ func readDir(d fs.ReadDirFile, limit int) ([]fs.DirEntry, bool, error) {
 
 type listing struct {
 	Title      string
+	Favicon    template.URL
 	Path       string
 	Crumbs     []crumb
 	HasParent  bool
@@ -1092,6 +1112,7 @@ func (h *prettyFileHandler) writeError(w http.ResponseWriter, r *http.Request, c
 	var buf bytes.Buffer
 	if err := errorTmpl.Execute(&buf, errorPage{
 		Title:      h.cfg.title,
+		Favicon:    template.URL(h.cfg.favicon), //nolint:gosec // G203: favicon comes from server config, not user input
 		Code:       code,
 		Status:     http.StatusText(code),
 		RetryAfter: retryAfter,
@@ -1112,6 +1133,7 @@ func (h *prettyFileHandler) writeError(w http.ResponseWriter, r *http.Request, c
 
 type errorPage struct {
 	Title      string
+	Favicon    template.URL
 	Code       int
 	Status     string
 	RetryAfter int

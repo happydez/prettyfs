@@ -29,11 +29,8 @@ linters:
         - shadow
     gosec:
       excludes:
-        - G204
         - G304
-        - G401
         - G404
-        - G501
     goconst:
       min-len: 5
       min-occurrences: 3

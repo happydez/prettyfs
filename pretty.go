@@ -57,6 +57,7 @@ type config struct {
 	proxyHops      int
 	browse         limits
 	download       limits
+	countEveryDL   bool
 	log            *slog.Logger
 }
 
@@ -161,10 +162,24 @@ func WithRateLimit(requests int, per time.Duration) Option {
 	}
 }
 
-// WithDownloadRateLimit limits distinct files and zips per IP.
+// WithDownloadRateLimit limits distinct files and zips per IP: repeated
+// downloads of the same path are free.
 func WithDownloadRateLimit(requests int, per time.Duration) Option {
 	return func(c *config) {
 		c.download.perIP = nil
+		c.countEveryDL = false
+		if l := newWindowLimiter(requests, per); l != nil {
+			c.download.perIP = l
+		}
+	}
+}
+
+// WithDownloadRequestRateLimit limits download requests per IP, counting every
+// request, even a repeated one for the same path.
+func WithDownloadRequestRateLimit(requests int, per time.Duration) Option {
+	return func(c *config) {
+		c.download.perIP = nil
+		c.countEveryDL = true
 		if l := newWindowLimiter(requests, per); l != nil {
 			c.download.perIP = l
 		}
@@ -475,6 +490,16 @@ type limits struct {
 
 const globalKey = "*"
 
+// downloadItem returns the limiter item for a download. When every request is
+// counted, only a Range request keeps its item, so a resumed download costs
+// one hit instead of one per chunk.
+func (h *prettyFileHandler) downloadItem(r *http.Request, item string) string {
+	if h.cfg.countEveryDL && r.Header.Get("Range") == "" {
+		return ""
+	}
+	return item
+}
+
 func (h *prettyFileHandler) allow(w http.ResponseWriter, r *http.Request, l limits, item, reason string) bool {
 	if l.perIP == nil && l.global == nil {
 		return true
@@ -566,7 +591,7 @@ func (h *prettyFileHandler) serveFile(w http.ResponseWriter, r *http.Request, f 
 		h.notFound(w, r)
 		return
 	}
-	if !h.allow(w, r, h.cfg.download, "file:"+name, "Download limit reached for your IP") {
+	if !h.allow(w, r, h.cfg.download, h.downloadItem(r, "file:"+name), "Download limit reached for your IP") {
 		return
 	}
 	if download {
@@ -593,7 +618,7 @@ func (h *prettyFileHandler) serveIndex(w http.ResponseWriter, r *http.Request, d
 	if err != nil || !fi.Mode().IsRegular() {
 		return false
 	}
-	if h.allow(w, r, h.cfg.download, "file:"+p, "Download limit reached for your IP") {
+	if h.allow(w, r, h.cfg.download, h.downloadItem(r, "file:"+p), "Download limit reached for your IP") {
 		h.serveContent(w, r, f, fi)
 	}
 
@@ -916,7 +941,7 @@ type zipItem struct {
 }
 
 func (h *prettyFileHandler) serveZip(w http.ResponseWriter, r *http.Request, dir string) {
-	if !h.allow(w, r, h.cfg.download, "zip:"+dir, "Download limit reached for your IP") {
+	if !h.allow(w, r, h.cfg.download, h.downloadItem(r, "zip:"+dir), "Download limit reached for your IP") {
 		return
 	}
 

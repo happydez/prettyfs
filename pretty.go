@@ -49,6 +49,9 @@ type config struct {
 	followSymlinks bool
 	sandbox        bool
 	allowZip       bool
+	zipSet         bool
+	allowDownload  bool
+	blockedExts    map[string]bool
 	zipMaxBytes    int64
 	zipMaxFiles    int
 	maxZips        int
@@ -115,9 +118,47 @@ func WithSandbox(enabled bool) Option {
 }
 
 // WithZip allows downloading folders as .zip. Enabled by default.
+// WithDownload(false) with WithZip(true) serves whole folders while refusing
+// the same files one by one.
 func WithZip(enabled bool) Option {
 	return func(c *config) {
 		c.allowZip = enabled
+		c.zipSet = true
+	}
+}
+
+// WithDownload allows downloading files. Enabled by default.
+//
+// When disabled, only files a browser displays in place: text, images, audio,
+// video, docs are served. Anything else would land on disk, so it is listed
+// without a link and returns 403.
+func WithDownload(enabled bool) Option {
+	return func(c *config) {
+		c.allowDownload = enabled
+	}
+}
+
+// WithBlockedExtensions refuses to serve files with the given extensions, with
+// or without a leading dot and in any case: WithBlockedExtensions(".zip", "EXE").
+// Blocked files stay visible in listings but carry no link, answer 403, and are
+// left out of folder archives. Calling it with no arguments clears the list.
+func WithBlockedExtensions(exts ...string) Option {
+	return func(c *config) {
+		c.blockedExts = nil
+		if len(exts) == 0 {
+			return
+		}
+		c.blockedExts = make(map[string]bool, len(exts))
+		for _, e := range exts {
+			e = strings.ToLower(strings.TrimSpace(e))
+			if e == "" || e == "." {
+				continue
+			}
+			if !strings.HasPrefix(e, ".") {
+				e = "." + e
+			}
+			c.blockedExts[e] = true
+		}
 	}
 }
 
@@ -163,7 +204,8 @@ func WithRateLimit(requests int, per time.Duration) Option {
 }
 
 // WithDownloadRateLimit limits distinct files and zips per IP: repeated
-// downloads of the same path are free.
+// downloads of the same path are free. Only attachments ("?download=1") and
+// zips count; viewing a file inline goes through WithRateLimit instead.
 func WithDownloadRateLimit(requests int, per time.Duration) Option {
 	return func(c *config) {
 		c.download.perIP = nil
@@ -175,7 +217,8 @@ func WithDownloadRateLimit(requests int, per time.Duration) Option {
 }
 
 // WithDownloadRequestRateLimit limits download requests per IP, counting every
-// request, even a repeated one for the same path.
+// request, even a repeated one for the same path, so a chunked download costs
+// one hit per chunk.
 func WithDownloadRequestRateLimit(requests int, per time.Duration) Option {
 	return func(c *config) {
 		c.download.perIP = nil
@@ -252,6 +295,7 @@ func FileServer(fsys fs.FS, opts ...Option) http.Handler {
 		serveIndex:    true,
 		sandbox:       true,
 		allowZip:      true,
+		allowDownload: true,
 		zipMaxBytes:   1 << 30,
 		zipMaxFiles:   10000,
 		maxZips:       4,
@@ -308,7 +352,8 @@ func (h *prettyFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	if h.cfg.serveIndex && strings.HasSuffix(r.URL.Path, "/index.html") && !q.Has("download") {
+	download := q.Has("download") && h.cfg.allowDownload
+	if h.cfg.serveIndex && strings.HasSuffix(r.URL.Path, "/index.html") && !download {
 		localRedirect(w, r, "./")
 		return
 	}
@@ -342,7 +387,7 @@ func (h *prettyFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			localRedirect(w, r, path.Base(r.URL.Path)+"/")
 			return
 		}
-		if q.Has("zip") && h.cfg.allowZip {
+		if q.Has("zip") && h.zipAllowed() {
 			h.serveZip(w, r, name)
 			return
 		}
@@ -357,7 +402,8 @@ func (h *prettyFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		localRedirect(w, r, "../"+path.Base(name))
 		return
 	}
-	h.serveFile(w, r, f, fi, name, q.Has("download"))
+
+	h.serveFile(w, r, f, fi, name, download)
 }
 
 // toFS converts a clean URL path ("/a/b") to an fs.FS name ("a/b").
@@ -395,6 +441,22 @@ func (h *prettyFileHandler) hiddenName(name string) bool {
 		return true
 	}
 	return !h.cfg.showHidden && strings.HasPrefix(name, ".")
+}
+
+// zipAllowed reports whether folder archives are served.
+func (h *prettyFileHandler) zipAllowed() bool {
+	if h.cfg.zipSet {
+		return h.cfg.allowZip
+	}
+	return h.cfg.allowZip && h.cfg.allowDownload
+}
+
+// blockedName reports whether name carries a blocked extension.
+func (h *prettyFileHandler) blockedName(name string) bool {
+	if len(h.cfg.blockedExts) == 0 {
+		return false
+	}
+	return h.cfg.blockedExts[strings.ToLower(path.Ext(name))]
 }
 
 func (h *prettyFileHandler) hiddenPath(p string) bool {
@@ -490,11 +552,10 @@ type limits struct {
 
 const globalKey = "*"
 
-// downloadItem returns the limiter item for a download. When every request is
-// counted, only a Range request keeps its item, so a resumed download costs
-// one hit instead of one per chunk.
-func (h *prettyFileHandler) downloadItem(r *http.Request, item string) string {
-	if h.cfg.countEveryDL && r.Header.Get("Range") == "" {
+// downloadItem returns the limiter item for a download. Counting every request
+// means no item at all.
+func (h *prettyFileHandler) downloadItem(item string) string {
+	if h.cfg.countEveryDL {
 		return ""
 	}
 	return item
@@ -591,13 +652,28 @@ func (h *prettyFileHandler) serveFile(w http.ResponseWriter, r *http.Request, f 
 		h.notFound(w, r)
 		return
 	}
-	if !h.allow(w, r, h.cfg.download, h.downloadItem(r, "file:"+name), "Download limit reached for your IP") {
+
+	if h.blockedName(name) {
+		h.renderError(w, r, http.StatusForbidden, "This file type is not available here")
 		return
+	}
+
+	ct := contentType(f, fi)
+	saved := download || !inlineType(ct)
+	if saved && !h.cfg.allowDownload {
+		h.renderError(w, r, http.StatusForbidden, "Downloads are disabled on this server")
+		return
+	}
+	if saved {
+		if !h.allow(w, r, h.cfg.download, h.downloadItem("file:"+name), "Download limit reached for your IP") {
+			return
+		}
 	}
 	if download {
 		w.Header().Set("Content-Disposition", attachment(fi.Name()))
 	}
-	h.serveContent(w, r, f, fi)
+
+	h.serveContent(w, r, f, fi, ct)
 }
 
 func (h *prettyFileHandler) serveIndex(w http.ResponseWriter, r *http.Request, dir string) bool {
@@ -618,14 +694,48 @@ func (h *prettyFileHandler) serveIndex(w http.ResponseWriter, r *http.Request, d
 	if err != nil || !fi.Mode().IsRegular() {
 		return false
 	}
-	if h.allow(w, r, h.cfg.download, h.downloadItem(r, "file:"+p), "Download limit reached for your IP") {
-		h.serveContent(w, r, f, fi)
-	}
+
+	h.serveContent(w, r, f, fi, contentType(f, fi))
 
 	return true
 }
 
-func (h *prettyFileHandler) serveContent(w http.ResponseWriter, r *http.Request, f fs.File, fi fs.FileInfo) {
+// contentType resolves the type used both for the response and for deciding
+// whether the browser will display the file or save it.
+func contentType(f fs.File, fi fs.FileInfo) string {
+	ct := mime.TypeByExtension(path.Ext(fi.Name()))
+	if ct == "" {
+		if rs, ok := f.(io.ReadSeeker); ok {
+			ct = sniff(rs)
+		}
+	}
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	return ct
+}
+
+// inlineType reports whether a browser renders ct in the page.
+func inlineType(ct string) bool {
+	mt, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return false
+	}
+	if base, _, ok := strings.Cut(mt, "/"); ok {
+		switch base {
+		case "text", "image", "video", "audio":
+			return true
+		}
+	}
+	switch mt {
+	case "application/pdf", "application/json", "application/xml",
+		"application/javascript", "application/xhtml+xml":
+		return true
+	}
+	return false
+}
+
+func (h *prettyFileHandler) serveContent(w http.ResponseWriter, r *http.Request, f fs.File, fi fs.FileInfo, ct string) {
 	hd := w.Header()
 	hd.Set("X-Content-Type-Options", "nosniff")
 	if h.cfg.cacheControl != "" && hd.Get("Cache-Control") == "" {
@@ -633,13 +743,6 @@ func (h *prettyFileHandler) serveContent(w http.ResponseWriter, r *http.Request,
 	}
 
 	rs, seekable := f.(io.ReadSeeker)
-	ct := mime.TypeByExtension(path.Ext(fi.Name()))
-	if ct == "" && seekable {
-		ct = sniff(rs)
-	}
-	if ct == "" {
-		ct = "application/octet-stream"
-	}
 	hd.Set("Content-Type", ct)
 	if h.cfg.sandbox && scriptable(ct) {
 		hd.Set("Content-Security-Policy", "sandbox")
@@ -727,7 +830,8 @@ func (h *prettyFileHandler) serveDir(w http.ResponseWriter, r *http.Request, f f
 		Path:      name,
 		Crumbs:    crumbs(name),
 		HasParent: name != "/",
-		Zip:       h.cfg.allowZip,
+		Zip:       h.zipAllowed(),
+		Download:  h.cfg.allowDownload,
 		Truncated: truncated,
 		Shown:     h.cfg.maxEntries,
 	}
@@ -755,8 +859,11 @@ func (h *prettyFileHandler) serveDir(w http.ResponseWriter, r *http.Request, f f
 		} else {
 			e.Size = fi.Size()
 			e.Kind, e.Ext = fileKind(n)
-			e.Href = href
 			e.DownloadHref = href + "?download=1"
+			ct := mime.TypeByExtension(path.Ext(n))
+			if !h.blockedName(n) && (h.cfg.allowDownload || ct == "" || inlineType(ct)) {
+				e.Href = href
+			}
 			data.TotalFiles++
 			data.TotalSize += e.Size
 		}
@@ -792,6 +899,9 @@ func readDir(d fs.ReadDirFile, limit int) ([]fs.DirEntry, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
+		if len(batch) == 0 {
+			break
+		}
 	}
 	if len(out) > limit {
 		return out[:limit], true, nil
@@ -807,6 +917,7 @@ type listing struct {
 	Crumbs     []crumb
 	HasParent  bool
 	Zip        bool
+	Download   bool
 	Truncated  bool
 	Shown      int
 	Entries    []entry
@@ -941,7 +1052,7 @@ type zipItem struct {
 }
 
 func (h *prettyFileHandler) serveZip(w http.ResponseWriter, r *http.Request, dir string) {
-	if !h.allow(w, r, h.cfg.download, h.downloadItem(r, "zip:"+dir), "Download limit reached for your IP") {
+	if !h.allow(w, r, h.cfg.download, h.downloadItem("zip:"+dir), "Download limit reached for your IP") {
 		return
 	}
 
@@ -1033,6 +1144,9 @@ func (h *prettyFileHandler) zipPlan(ctx context.Context, root string) ([]zipItem
 					return err
 				}
 			case fi.Mode().IsRegular():
+				if h.blockedName(n) {
+					continue
+				}
 				total += fi.Size()
 				items = append(items, zipItem{path: child, zpath: prefix + n, info: fi})
 			default:
@@ -1073,6 +1187,9 @@ func (h *prettyFileHandler) zipWrite(zw *zip.Writer, it zipItem) error {
 
 	f, err := h.fsys.Open(toFS(it.path))
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		return err
 	}
 	defer func() {

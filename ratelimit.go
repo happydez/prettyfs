@@ -76,8 +76,7 @@ func (l *windowLimiter) Allow(key, item string) (bool, time.Duration) {
 	if item != "" {
 		for j := range hs {
 			if hs[j].item == item {
-				hs = append(hs[:j], hs[j+1:]...)
-				l.hits[key] = append(hs, hit{at: now, item: item})
+				l.hits[key] = hs
 				return true, 0
 			}
 		}

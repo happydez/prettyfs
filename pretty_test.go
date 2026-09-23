@@ -30,6 +30,10 @@ func testFS() fs.FS {
 		"pub/inner/.private":     {},
 		"pub/inner/x.txt":        {Data: []byte("x")},
 		"site/index.html":        {Data: []byte("<h1>site</h1>")},
+		"assets.zip":             {Data: []byte("PK\x03\x04zip"), ModTime: mt},
+		"main.go":                {Data: []byte("package main\n"), ModTime: mt},
+		"style.css":              {Data: []byte("body{}"), ModTime: mt},
+		"bin/tool":               {Data: []byte("\x7fELF\x00\x01\x02\x00binary"), ModTime: mt},
 	}
 }
 
@@ -358,24 +362,169 @@ func TestRateLimit(t *testing.T) {
 		}
 	}
 
-	if c := do(h, "GET", "/hello.txt").Code; c != 200 {
+	for i := 0; i < 5; i++ {
+		if c := do(h, "GET", "/docs/readme.md").Code; c != 200 {
+			t.Fatalf("inline view %d limited by download limiter: %d", i, c)
+		}
+	}
+
+	if c := do(h, "GET", "/hello.txt?download=1").Code; c != 200 {
 		t.Fatalf("first download: %d", c)
 	}
 
-	if c := do(h, "GET", "/hello.txt", "Range", "bytes=5-").Code; c != http.StatusPartialContent {
+	if c := do(h, "GET", "/hello.txt?download=1", "Range", "bytes=5-").Code; c != http.StatusPartialContent {
 		t.Fatalf("range of same file: %d, want 206", c)
 	}
 
 	if c := do(h, "GET", "/hello.txt?download=1").Code; c != 200 {
-		t.Fatalf("same file with ?download: %d", c)
+		t.Fatalf("same file again: %d", c)
 	}
 
-	if c := do(h, "GET", "/docs/readme.md").Code; c != 429 {
+	if c := do(h, "GET", "/docs/readme.md?download=1").Code; c != 429 {
 		t.Fatalf("second file: %d, want 429", c)
 	}
 
-	if b := do(h, "GET", "/docs/readme.md", "Accept", "text/html").Body.String(); !strings.Contains(b, "try again") {
+	if b := do(h, "GET", "/docs/readme.md?download=1", "Accept", "text/html").Body.String(); !strings.Contains(b, "try again") {
 		t.Error("html 429 page has no retry button")
+	}
+}
+
+func TestBlockedExtensions(t *testing.T) {
+	h := FileServer(testFS(), WithBlockedExtensions("ZIP", ".Go"))
+
+	for _, p := range []string{"/assets.zip", "/assets.zip?download=1", "/main.go"} {
+		if c := do(h, "GET", p).Code; c != http.StatusForbidden {
+			t.Errorf("%s: code = %d, want 403", p, c)
+		}
+	}
+
+	body := do(h, "GET", "/").Body.String()
+	for _, n := range []string{"assets.zip", "main.go"} {
+		if !strings.Contains(body, n) {
+			t.Errorf("%s must stay listed", n)
+		}
+		if strings.Contains(body, `href="`+n+`"`) {
+			t.Errorf("%s must be listed without a link", n)
+		}
+	}
+	if !strings.Contains(body, `href="style.css"`) {
+		t.Error("other files must keep their links")
+	}
+	if c := do(h, "GET", "/style.css").Code; c != 200 {
+		t.Errorf("style.css: %d", c)
+	}
+
+	if names := zipNames(t, do(h, "GET", "/?zip=1").Body.Bytes()); names["assets.zip"] || names["main.go"] {
+		t.Errorf("zip carries blocked files: %v", names)
+	}
+
+	h = FileServer(testFS(), WithBlockedExtensions(".zip"), WithBlockedExtensions())
+	if c := do(h, "GET", "/assets.zip").Code; c != 200 {
+		t.Errorf("after clearing: %d, want 200", c)
+	}
+}
+
+func TestNonInlineCountsAsDownload(t *testing.T) {
+	h := FileServer(testFS(), WithDownloadRequestRateLimit(2, time.Minute))
+
+	for i := 0; i < 2; i++ {
+		if c := do(h, "GET", "/assets.zip").Code; c != 200 {
+			t.Fatalf("archive %d: %d", i, c)
+		}
+	}
+	if c := do(h, "GET", "/assets.zip").Code; c != 429 {
+		t.Fatalf("third archive: %d, want 429", c)
+	}
+
+	for i := 0; i < 5; i++ {
+		if c := do(h, "GET", "/docs/readme.md").Code; c != 200 {
+			t.Fatalf("inline view %d: %d", i, c)
+		}
+	}
+}
+
+func TestZipVsDownload(t *testing.T) {
+	zipped := func(opts ...Option) bool {
+		rec := do(FileServer(testFS(), opts...), "GET", "/?zip=1")
+		if rec.Code != 200 {
+			t.Fatalf("?zip=1: code = %d", rec.Code)
+		}
+		return strings.HasPrefix(rec.Header().Get("Content-Type"), "application/zip")
+	}
+
+	cases := []struct {
+		name string
+		opts []Option
+		want bool
+	}{
+		{"default", nil, true},
+		{"downloads off", []Option{WithDownload(false)}, false},
+		{"downloads off, zip asked for", []Option{WithDownload(false), WithZip(true)}, true},
+		{"zip asked for, downloads off", []Option{WithZip(true), WithDownload(false)}, true},
+		{"downloads off, zip refused", []Option{WithDownload(false), WithZip(false)}, false},
+		{"zip refused", []Option{WithZip(false)}, false},
+	}
+	for _, c := range cases {
+		if got := zipped(c.opts...); got != c.want {
+			t.Errorf("%s: archive served = %v, want %v", c.name, got, c.want)
+		}
+	}
+
+	h := FileServer(testFS(), WithDownload(false), WithZip(true))
+	if c := do(h, "GET", "/assets.zip").Code; c != http.StatusForbidden {
+		t.Errorf("single file: code = %d, want 403", c)
+	}
+	if b := do(h, "GET", "/").Body.String(); !strings.Contains(b, "?zip=1") {
+		t.Error("zip button must be back in the listing")
+	}
+}
+
+func TestNoDownload(t *testing.T) {
+	h := FileServer(testFS(), WithDownload(false))
+
+	body := do(h, "GET", "/").Body.String()
+	if strings.Contains(body, "?download=1") {
+		t.Error("listing still has a download button")
+	}
+	if strings.Contains(body, "?zip=1") {
+		t.Error("listing still offers folder archives")
+	}
+
+	rec := do(h, "GET", "/hello.txt?download=1")
+	if rec.Code != 200 || rec.Body.String() != "hello, world" {
+		t.Fatalf("file still served inline: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if cd := rec.Header().Get("Content-Disposition"); cd != "" {
+		t.Errorf("Content-Disposition = %q, want none", cd)
+	}
+
+	if loc := do(h, "GET", "/site/index.html?download=1").Header().Get("Location"); loc != "./?download=1" {
+		t.Errorf("index.html?download=1: Location = %q", loc)
+	}
+
+	for _, p := range []string{"/assets.zip", "/assets.zip?download=1", "/bin/tool"} {
+		if c := do(h, "GET", p).Code; c != http.StatusForbidden {
+			t.Errorf("%s: code = %d, want 403", p, c)
+		}
+	}
+	if strings.Contains(body, `href="assets.zip"`) {
+		t.Error("listing links a file that cannot be opened")
+	}
+	if !strings.Contains(body, "assets.zip") {
+		t.Error("the file must still be listed by name")
+	}
+
+	for _, n := range []string{"main.go", "style.css"} {
+		if c := do(h, "GET", "/"+n).Code; c != 200 {
+			t.Errorf("%s: code = %d, want 200", n, c)
+		}
+		if !strings.Contains(body, `href="`+n+`"`) {
+			t.Errorf("%s: listed without a link", n)
+		}
+	}
+
+	if b := do(FileServer(testFS()), "GET", "/").Body.String(); !strings.Contains(b, "?download=1") {
+		t.Error("download button missing by default")
 	}
 }
 
@@ -386,26 +535,32 @@ func TestDownloadRequestRateLimit(t *testing.T) {
 		if c := do(h, "GET", "/").Code; c != 200 {
 			t.Fatalf("listing limited by download limiter: %d", c)
 		}
+		if c := do(h, "GET", "/hello.txt").Code; c != 200 {
+			t.Fatalf("inline view %d limited by download limiter: %d", i, c)
+		}
 	}
 
-	if c := do(h, "GET", "/hello.txt").Code; c != 200 {
+	if c := do(h, "GET", "/hello.txt?download=1").Code; c != 200 {
 		t.Fatalf("first download: %d", c)
 	}
-	if c := do(h, "GET", "/hello.txt").Code; c != 200 {
+	if c := do(h, "GET", "/hello.txt?download=1").Code; c != 200 {
 		t.Fatalf("second download: %d", c)
 	}
-	if c := do(h, "GET", "/hello.txt").Code; c != 429 {
+	if c := do(h, "GET", "/hello.txt?download=1").Code; c != 429 {
 		t.Fatalf("third download of the same file: %d, want 429", c)
 	}
 
 	h = FileServer(testFS(), WithDownloadRequestRateLimit(2, time.Minute))
-	for i := 0; i < 5; i++ {
-		if c := do(h, "GET", "/hello.txt", "Range", "bytes=0-1").Code; c != http.StatusPartialContent {
+	for i := 0; i < 2; i++ {
+		if c := do(h, "GET", "/hello.txt?download=1", "Range", "bytes=0-1").Code; c != http.StatusPartialContent {
 			t.Fatalf("range chunk %d: %d, want 206", i, c)
 		}
 	}
-	if c := do(h, "GET", "/docs/readme.md").Code; c != 200 {
-		t.Fatalf("second file after ranges: %d", c)
+	if c := do(h, "GET", "/hello.txt?download=1", "Range", "bytes=0-1").Code; c != 429 {
+		t.Fatalf("third range chunk: %d, want 429", c)
+	}
+	if c := do(h, "GET", "/docs/?zip=1", "Range", "bytes=0-").Code; c != 429 {
+		t.Fatalf("zip with Range: %d, want 429", c)
 	}
 }
 
@@ -421,14 +576,17 @@ func TestGlobalRateLimit(t *testing.T) {
 
 func TestGlobalDownloadRateLimit(t *testing.T) {
 	h := FileServer(testFS(), WithGlobalDownloadRateLimit(2, time.Minute))
-	if doFrom(h, "10.0.0.1", "/hello.txt") != 200 || doFrom(h, "10.0.0.2", "/hello.txt") != 200 {
+	if doFrom(h, "10.0.0.1", "/hello.txt?download=1") != 200 || doFrom(h, "10.0.0.2", "/hello.txt?download=1") != 200 {
 		t.Fatal("two clients, same file: both must pass")
 	}
-	if c := doFrom(h, "10.0.0.1", "/hello.txt"); c != 200 {
+	if c := doFrom(h, "10.0.0.1", "/hello.txt?download=1"); c != 200 {
 		t.Fatalf("repeat by same client: %d", c)
 	}
-	if c := doFrom(h, "10.0.0.3", "/hello.txt"); c != 429 {
+	if c := doFrom(h, "10.0.0.3", "/hello.txt?download=1"); c != 429 {
 		t.Fatalf("third client: %d, want 429", c)
+	}
+	if c := doFrom(h, "10.0.0.3", "/hello.txt"); c != 200 {
+		t.Fatalf("inline view: %d", c)
 	}
 	if c := doFrom(h, "10.0.0.3", "/"); c != 200 {
 		t.Fatalf("listing: %d", c)
@@ -446,6 +604,48 @@ func TestDisabledLimits(t *testing.T) {
 		if c := do(h, "GET", "/hello.txt").Code; c != 200 {
 			t.Fatalf("request %d: %d", i, c)
 		}
+	}
+}
+
+func TestWindowLimiter(t *testing.T) {
+	now := time.Now()
+	l := newWindowLimiter(2, time.Minute)
+	l.now = func() time.Time { return now }
+
+	for i := 0; i < 2; i++ {
+		if ok, _ := l.Allow("ip", ""); !ok {
+			t.Fatalf("hit %d must pass", i)
+		}
+	}
+	if ok, retry := l.Allow("ip", ""); ok || retry != time.Minute {
+		t.Fatalf("third hit: ok=%v retry=%v", ok, retry)
+	}
+
+	now = now.Add(30 * time.Second)
+	if ok, retry := l.Allow("ip", ""); ok || retry != 30*time.Second {
+		t.Fatalf("mid-window: ok=%v retry=%v, want false and 30s", ok, retry)
+	}
+
+	now = now.Add(31 * time.Second)
+	if ok, _ := l.Allow("ip", ""); !ok {
+		t.Error("window must slide")
+	}
+
+	l = newWindowLimiter(1, time.Minute)
+	base := now
+	l.now = func() time.Time { return base }
+	if ok, _ := l.Allow("ip", "file:a"); !ok {
+		t.Fatal("first item must pass")
+	}
+	for i := 0; i < 5; i++ {
+		base = base.Add(50 * time.Second)
+		if ok, _ := l.Allow("ip", "file:a"); !ok {
+			t.Fatalf("repeat %d must stay free", i)
+		}
+	}
+	base = base.Add(10 * time.Second)
+	if ok, _ := l.Allow("ip", "file:b"); !ok {
+		t.Error("a hot item must not hold the only slot forever")
 	}
 }
 

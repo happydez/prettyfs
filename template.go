@@ -89,6 +89,7 @@ header{padding-bottom:22px}
 .name a::after{content:"";position:absolute;inset:0}
 .name a:focus-visible{outline:none}
 .row.dir .name a{font-weight:600}
+.name .off{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--muted);cursor:default}
 .ic{width:24px;height:24px;flex:none;color:var(--ink)}
 .ic .bg{fill:var(--paper)}.ic .cut{stroke:var(--paper);fill:none}
 .row:hover .ic .bg{fill:var(--hover)}
@@ -132,10 +133,10 @@ header{padding-bottom:22px}
   {{end}}
   {{range .Entries}}
   <div class="row{{if .IsDir}} dir{{end}}">
-    <div class="name">{{icon .Kind}}<a href="{{.Href}}" title="{{.Name}}">{{.Name}}{{if .IsDir}}/{{end}}</a>{{if .Ext}}<span class="ext">{{.Ext}}</span>{{end}}</div>
+    <div class="name">{{icon .Kind}}{{if .Href}}<a href="{{.Href}}" title="{{.Name}}">{{.Name}}{{if .IsDir}}/{{end}}</a>{{else}}<span class="off" title="{{.Name}} - downloads are disabled">{{.Name}}</span>{{end}}{{if .Ext}}<span class="ext">{{.Ext}}</span>{{end}}</div>
     <div class="date" title="{{.ModTime.Format "2006-01-02 15:04:05 MST"}}">{{.ModTime.Format "2006-01-02 15:04"}}</div>
     <div class="size">{{if .IsDir}}—{{else}}{{bytes .Size}}{{end}}</div>
-    {{if or (not .IsDir) $.Zip}}<a class="dl" href="{{.DownloadHref}}" title="Download{{if .IsDir}} as .zip{{end}}" aria-label="Download {{.Name}}">{{icon "download"}}</a>{{else}}<div></div>{{end}}
+    {{if or (and .IsDir $.Zip) (and (not .IsDir) $.Download)}}<a class="dl" href="{{.DownloadHref}}" title="Download{{if .IsDir}} as .zip{{end}}" aria-label="Download {{.Name}}">{{icon "download"}}</a>{{else}}<div></div>{{end}}
   </div>
   {{end}}
   {{if not .Entries}}<div class="empty">empty folder</div>{{end}}
